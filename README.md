@@ -1,6 +1,6 @@
-# TTL Cleaner - ESCO Skills Data Processor
+# SkoHub TTL Cleaner
 
-Ein spezialisiertes Tool zur Bereinigung und Korrektur von TTL (Turtle) Dateien mit SKOS-Konzepten, insbesondere für ESCO Skills Daten.
+Ein spezialisiertes Tool zur Bereinigung und Korrektur von TTL (Turtle) Dateien mit SKOS-Konzepten.
 
 ## 🎯 Hauptfunktionen
 
@@ -395,4 +395,4 @@ echo All TTL files cleaned!
 
 ---
 
-**Für weitere Informationen und Support kontaktieren Sie das Skills&More Entwicklungsteam.**
+**Für weitere Informationen und Support kontaktieren Sie mich.**
