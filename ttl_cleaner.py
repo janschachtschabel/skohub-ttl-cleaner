@@ -20,12 +20,11 @@ from pathlib import Path
 from typing import Dict, List, Set, Tuple, Optional
 from collections import defaultdict, Counter
 import urllib.parse
-import urllib.parse
 
 class TTLCleaner:
     """Clean and validate TTL files with SKOS integrity checks and performance optimizations."""
     
-    def __init__(self, chunk_size=1000, enable_validation=True, memory_efficient=False, enable_skos_xl=False):
+    def __init__(self, chunk_size=1000, enable_validation=True, memory_efficient=False, enable_skos_xl=False, autofix_broader=False, warn_missing_narrower: bool = False):
         self.stats = {
             'total_concepts': 0,
             'duplicates_removed': 0,
@@ -46,9 +45,12 @@ class TTLCleaner:
         self.change_log = []
         self.validation_violations = []
         self.validation_warnings = []
+        self.validation_infos = []
         self.base_declaration = None
         self.concept_scheme = None
         self.other_metadata = []
+        # Base URI (from @base) for resolving relative URIs
+        self.base_uri = None
         
         # Performance settings
         self.chunk_size = chunk_size
@@ -58,6 +60,14 @@ class TTLCleaner:
         
         # SKOS-XL support
         self.enable_skos_xl = enable_skos_xl
+        
+        # Autofix options
+        self.autofix_broader = autofix_broader
+        
+        # Validation verbosity options
+        # If True, warn when a parent lacks explicit skos:narrower for an existing in-branch broader link
+        # Default False to avoid noisy, non-mandatory warnings (inverse can be inferred by consumers)
+        self.warn_missing_narrower = warn_missing_narrower
 
     def clean_ttl_file(self, input_path: str, output_path: Optional[str] = None, generate_reports: bool = True) -> bool:
         """Clean TTL file and save cleaned version."""
@@ -83,9 +93,20 @@ class TTLCleaner:
             else:
                 cleaned_concepts = self._clean_concepts(concepts)
 
+            # Optional autofix: add missing skos:broader links to the nearest prefix parent
+            if self.autofix_broader:
+                try:
+                    print("[INFO] Applying hierarchy autofix for missing skos:broader links...")
+                    added = self._apply_hierarchy_autofix(cleaned_concepts)
+                    print(f"[INFO] Autofix complete. Broader links added: {added}")
+                except Exception as e:
+                    print(f"[DEBUG] Error during hierarchy autofix: {e}")
+                    raise
+
             # Perform SKOS validation (if enabled)
             all_violations = []
             all_warnings = []
+            self.validation_infos = []
             
             if self.enable_validation:
                 if self.memory_efficient and len(cleaned_concepts) > self.chunk_size:
@@ -134,6 +155,28 @@ class TTLCleaner:
                         except Exception as e:
                             print(f"[DEBUG] Error in SKOS-XL validation: {e}")
                             raise
+                    
+                    # Hierarchy gap and parent-child consistency validation
+                    try:
+                        print("[DEBUG] Starting hierarchy validation (missing levels, broader/narrower consistency)...")
+                        violations, warnings = self._validate_hierarchy_gaps(cleaned_concepts)
+                        all_violations.extend(violations)
+                        all_warnings.extend(warnings)
+                        print(f"[DEBUG] Hierarchy validation completed: {len(violations)} violations, {len(warnings)} warnings")
+                    except Exception as e:
+                        print(f"[DEBUG] Error in hierarchy validation: {e}")
+                        raise
+                    
+                    # ConceptScheme consistency validation (inScheme/topConceptOf, hasTopConcept integrity)
+                    try:
+                        print("[DEBUG] Starting scheme consistency validation (inScheme/topConceptOf, hasTopConcept)...")
+                        violations, warnings = self._validate_scheme_consistency(cleaned_concepts)
+                        all_violations.extend(violations)
+                        all_warnings.extend(warnings)
+                        print(f"[DEBUG] Scheme consistency validation completed: {len(violations)} violations, {len(warnings)} warnings")
+                    except Exception as e:
+                        print(f"[DEBUG] Error in scheme consistency validation: {e}")
+                        raise
                 
                 # Store validation results
                 self.validation_violations = all_violations
@@ -154,7 +197,7 @@ class TTLCleaner:
             
             # Print validation report (only if validation was enabled)
             if self.enable_validation:
-                print(self._generate_validation_report(all_violations, all_warnings))
+                print(self._generate_validation_report(all_violations, all_warnings, self.validation_infos))
             
             # Generate reports if requested
             if generate_reports:
@@ -163,10 +206,14 @@ class TTLCleaner:
                     log_path = Path(output_path).parent / f"{Path(output_path).stem}_changes.log"
                     self._write_change_log(log_path)
                 
-                # Write validation report if validation was enabled
-                if self.enable_validation and (all_violations or all_warnings):
+                # Write validation report if validation was enabled (even when zero findings)
+                if self.enable_validation:
                     validation_path = Path(output_path).parent / f"{Path(output_path).stem}_validation.log"
-                    self._write_validation_report(validation_path, all_violations, all_warnings)
+                    self._write_validation_report(validation_path, all_violations, all_warnings, self.validation_infos)
+                
+                # Write combined full report
+                full_log_path = Path(output_path).parent / f"{Path(output_path).stem}_full.log"
+                self._write_combined_report(str(full_log_path), input_path, output_path, all_violations, all_warnings, self.validation_infos)
 
             return True
 
@@ -601,6 +648,170 @@ class TTLCleaner:
         
         return violations, warnings
     
+    def _validate_scheme_consistency(self, concepts: List[Dict]) -> Tuple[List[str], List[str]]:
+        """Validate inScheme/topConceptOf consistency and hasTopConcept integrity.
+        - If a concept has skos:topConceptOf S, it must also have skos:inScheme S.
+        - For each skos:hasTopConcept on the ConceptScheme, the target must be a Concept
+          and must have skos:inScheme pointing to the same scheme.
+        """
+        violations: List[str] = []
+        warnings: List[str] = []
+        infos: List[str] = []
+        
+        # Build quick lookups for concepts and their scheme relations
+        concept_uris: Set[str] = set()
+        in_scheme: Dict[str, Set[str]] = defaultdict(set)  # concept_uri -> set of scheme URIs (with <>)
+        top_of: Dict[str, Set[str]] = defaultdict(set)     # concept_uri -> set of scheme URIs (with <>)
+        
+        for c in concepts:
+            uri = c.get('uri', '')
+            if not uri:
+                continue
+            concept_uris.add(uri)
+            for prop in c.get('other_properties', []):
+                if 'skos:inScheme ' in prop:
+                    scheme_uris = getattr(self, '_extract_uris_from_property', lambda p: [self._extract_uri_from_property(p)] if self._extract_uri_from_property(p) else [])(prop)
+                    for scheme_uri in scheme_uris:
+                        if scheme_uri:
+                            in_scheme[uri].add(scheme_uri)
+                if 'skos:topConceptOf ' in prop:
+                    scheme_uris = getattr(self, '_extract_uris_from_property', lambda p: [self._extract_uri_from_property(p)] if self._extract_uri_from_property(p) else [])(prop)
+                    for scheme_uri in scheme_uris:
+                        if scheme_uri:
+                            top_of[uri].add(scheme_uri)
+        
+        # Check: topConceptOf implies inScheme for same scheme
+        for concept_uri, schemes in top_of.items():
+            for scheme_token in schemes:
+                if scheme_token not in in_scheme.get(concept_uri, set()):
+                    violations.append(
+                        f"Concept <{concept_uri}> has topConceptOf {scheme_token} but is missing inScheme {scheme_token}"
+                    )
+        
+        # Parse hasTopConcept relations from the ConceptScheme block (metadata)
+        if self.concept_scheme:
+            # Attempt to extract the scheme subject URI
+            scheme_subject = None
+            first_line = self.concept_scheme.split('\n', 1)[0].strip()
+            m = re.match(r'^(<[^>]+>|[a-zA-Z0-9_:/-]+)\s+a\s+skos:ConceptScheme', first_line)
+            if m:
+                scheme_subject = m.group(1)
+                # Extract inner value and normalize using _clean_uri for robust comparisons
+                if scheme_subject.startswith('<') and scheme_subject.endswith('>'):
+                    scheme_subject_inner = scheme_subject[1:-1]
+                else:
+                    scheme_subject_inner = scheme_subject
+                scheme_subject_bare = self._clean_uri(scheme_subject_inner)
+                # Prepare both raw and normalized tokens for membership checks in inScheme
+                scheme_subject_raw_token = f"<{scheme_subject_inner}>"
+                scheme_subject_norm_token = f"<{scheme_subject_bare}>"
+            else:
+                scheme_subject_bare = None
+                scheme_subject_raw_token = None
+                scheme_subject_norm_token = None
+            
+            # Find hasTopConcept targets
+            targets = re.findall(r'skos:hasTopConcept\s+<([^>]+)>', self.concept_scheme)
+            for target in targets:
+                # Normalize target to bare absolute URI for comparison with concept_uris
+                raw_target_inner = target.strip()
+                target_bare = self._clean_uri(raw_target_inner)
+                # Target must be a known Concept
+                if target_bare not in concept_uris:
+                    violations.append(f"hasTopConcept points to non-Concept: <{target_bare}>")
+                    continue
+                # Target concept must have inScheme = scheme_subject
+                if scheme_subject_bare:
+                    # Accept either the raw or normalized token depending on how it appears in concept properties
+                    expected_tokens = set()
+                    if scheme_subject_raw_token:
+                        expected_tokens.add(scheme_subject_raw_token)
+                    if scheme_subject_norm_token:
+                        expected_tokens.add(scheme_subject_norm_token)
+                    target_in_schemes = in_scheme.get(target_bare, set())
+                    if expected_tokens and not (target_in_schemes & expected_tokens):
+                        # Prefer reporting using the raw token for readability
+                        report_token = scheme_subject_raw_token or scheme_subject_norm_token
+                        violations.append(
+                            f"Concept <{target_bare}> is hasTopConcept of {report_token} but missing inScheme {report_token}"
+                        )
+        
+        return violations, warnings
+
+    def _apply_hierarchy_autofix(self, concepts: List[Dict]) -> int:
+        """Autofix: For concepts whose local IDs end with a code token (digits and optional
+        hyphen-separated segments, e.g., '42-10', '311'), ensure they have a skos:broader to
+        the nearest existing prefix parent concept (based on segment-aware prefixes).
+        Adds the missing 'skos:broader <parent>' triple as needed.
+        Returns the number of broader links added.
+        """
+        added = 0
+        # Build maps code <-> uri
+        code_to_uri: Dict[str, str] = {}
+        uri_to_code: Dict[str, str] = {}
+        for c in concepts:
+            uri = c.get('uri', '')
+            code = self._extract_numeric_code(uri)
+            if code:
+                code_to_uri[code] = uri
+                uri_to_code[uri] = code
+
+        if not code_to_uri:
+            return 0
+
+        all_codes = set(code_to_uri.keys())
+
+        # Build current broader map (by codes)
+        broader_map: Dict[str, Set[str]] = defaultdict(set)
+        for c in concepts:
+            src_uri = c.get('uri', '')
+            src_code = uri_to_code.get(src_uri)
+            if not src_code:
+                continue
+            for prop in c.get('other_properties', []):
+                if 'skos:broader ' in prop:
+                    tgt_uris = getattr(self, '_extract_uris_from_property', lambda p: [self._extract_uri_from_property(p)] if self._extract_uri_from_property(p) else [])(prop)
+                    for tgt_uri_like in tgt_uris:
+                        tgt_code = self._extract_numeric_code(tgt_uri_like or '')
+                        if tgt_code:
+                            broader_map[src_code].add(tgt_code)
+
+        # For each concept, add broader to the longest existing prefix if none of the prefixes is referenced
+        for c in concepts:
+            uri = c.get('uri', '')
+            code = uri_to_code.get(uri)
+            # Determine valid parent prefixes for this code
+            prefixes = self._code_prefixes(code) if code else []
+            if not code or not prefixes:
+                continue
+
+            # Collect existing prefix candidates that actually exist as concepts
+            candidates = [p for p in prefixes if p in all_codes]
+            if not candidates:
+                # No existing prefix concepts to link to
+                continue
+            existing_broader_codes = broader_map.get(code, set())
+            # If any prefix already referenced, skip
+            if existing_broader_codes & set(candidates):
+                continue
+
+            # Choose the longest existing prefix as the immediate parent to link to
+            parent_code = max(candidates, key=len)
+            parent_uri = code_to_uri[parent_code]
+            triple = f"skos:broader <{parent_uri.strip('<>')}>"
+
+            # Avoid duplicates defensively
+            props = c.get('other_properties', [])
+            if triple not in props:
+                props.append(triple)
+                c['other_properties'] = props
+                added += 1
+                self.change_log.append(
+                    f"Autofix: added skos:broader <{parent_uri.strip('<>')}> to <{uri}> based on code {code}"
+                )
+
+        return added
+    
     def _validate_semantic_relations(self, concepts: List[Dict]) -> Tuple[List[str], List[str]]:
         """Validate semantic relations for SKOS compliance - simplified to avoid iteration errors."""
         violations = []
@@ -617,13 +828,15 @@ class TTLCleaner:
             
             for prop in other_props:
                 if 'skos:broader ' in prop:
-                    target = self._extract_uri_from_property(prop)
-                    if target:
-                        broader_relations.append((uri, target))
+                    targets = getattr(self, '_extract_uris_from_property', lambda p: [self._extract_uri_from_property(p)] if self._extract_uri_from_property(p) else [])(prop)
+                    for target in targets:
+                        if target:
+                            broader_relations.append((uri, target))
                 elif 'skos:related ' in prop:
-                    target = self._extract_uri_from_property(prop)
-                    if target:
-                        related_relations.append((uri, target))
+                    targets = getattr(self, '_extract_uris_from_property', lambda p: [self._extract_uri_from_property(p)] if self._extract_uri_from_property(p) else [])(prop)
+                    for target in targets:
+                        if target:
+                            related_relations.append((uri, target))
         
         # Simple check: if same concepts are both broader and related, that's a violation
         broader_set = set(broader_relations)
@@ -666,6 +879,150 @@ class TTLCleaner:
         
         return violations, warnings
     
+    def _extract_numeric_code(self, uri_or_token: str) -> Optional[str]:
+        """Extract trailing code token from a URI or token.
+        Captures digits with optional hyphen-separated segments at the end of the token.
+        Examples: '<42-10>' -> '42-10', 'http://.../311' -> '311'. Returns the code token as string.
+        """
+        if not uri_or_token:
+            return None
+        s = uri_or_token.strip()
+        # If enclosed in angle brackets, strip them
+        if s.startswith('<') and s.endswith('>'):
+            s = s[1:-1]
+        # If full URI, take last path segment
+        if '/' in s:
+            s = s.rstrip('/').split('/')[-1]
+        # Now extract trailing token: digits with optional hyphen-separated segments
+        m = re.search(r'(\d+(?:-\d+)*)$', s)
+        return m.group(1) if m else None
+
+    def _code_prefixes(self, code: Optional[str]) -> List[str]:
+        """Return valid parent code prefixes for a given code token.
+        Segment-aware:
+        - For hyphenated codes like '44-1-2' -> ['44-1', '44']
+        - For hyphenated two-level like '42-10' -> ['42', '4'] (include higher digit-only fallback)
+        - For plain digits like '311' -> ['31', '3']
+        Excludes the code itself.
+        """
+        if not code:
+            return []
+        prefixes: List[str] = []
+        if '-' in code:
+            parts = code.split('-')
+            # Build segment-based prefixes, excluding the full code
+            for i in range(len(parts) - 1, 0, -1):
+                prefixes.append('-'.join(parts[:i]))
+            # Also include numeric fallbacks from the first segment (e.g., '42' -> '4')
+            first = parts[0]
+            if first.isdigit() and len(first) > 1:
+                for k in range(len(first) - 1, 0, -1):
+                    prefixes.append(first[:k])
+        else:
+            # Plain digits: progressively shorter prefixes
+            if code.isdigit() and len(code) > 1:
+                for k in range(len(code) - 1, 0, -1):
+                    prefixes.append(code[:k])
+        # Keep order from longest to shortest, de-duplicated while preserving order
+        seen = set()
+        result: List[str] = []
+        for p in prefixes:
+            if p not in seen:
+                seen.add(p)
+                result.append(p)
+        return result
+    
+    def _validate_hierarchy_gaps(self, concepts: List[Dict]) -> Tuple[List[str], List[str]]:
+        """Detect missing intermediate hierarchical levels based on code tokens and
+        check broader/narrower consistency with expected parents derived from the code.
+        
+        Rules:
+        - For a concept with code C (digits and optional hyphen segments), all segment-aware
+          prefixes of C should exist as concepts (warning if missing).
+        - If any parent prefix exists, the concept should have skos:broader to at least one
+          of those existing prefixes (violation if none referenced). Optionally warn if parent lacks
+          skos:narrower back-link.
+        Only applies to concepts whose local IDs end with a code token.
+        """
+        violations: List[str] = []
+        warnings: List[str] = []
+        infos: List[str] = []
+        
+        # Build maps code <-> uri
+        code_to_uri: Dict[str, str] = {}
+        uri_to_code: Dict[str, str] = {}
+        for c in concepts:
+            uri = c.get('uri', '')
+            code = self._extract_numeric_code(uri)
+            if code:
+                code_to_uri[code] = uri
+                uri_to_code[uri] = code
+        all_codes = set(code_to_uri.keys())
+        
+        if not all_codes:
+            return violations, warnings
+        
+        # Build broader and narrower maps using codes
+        broader_map: Dict[str, Set[str]] = defaultdict(set)
+        narrower_map: Dict[str, Set[str]] = defaultdict(set)
+        for c in concepts:
+            src_uri = c.get('uri', '')
+            src_code = uri_to_code.get(src_uri)
+            if not src_code:
+                continue
+            for prop in c.get('other_properties', []):
+                if 'skos:broader ' in prop:
+                    tgt_uris = self._extract_uris_from_property(prop)
+                    for tgt_uri_like in tgt_uris:
+                        tgt_code = self._extract_numeric_code(tgt_uri_like or '')
+                        if tgt_code:
+                            broader_map[src_code].add(tgt_code)
+                elif 'skos:narrower ' in prop:
+                    tgt_uris = self._extract_uris_from_property(prop)
+                    for tgt_uri_like in tgt_uris:
+                        tgt_code = self._extract_numeric_code(tgt_uri_like or '')
+                        if tgt_code:
+                            narrower_map[src_code].add(tgt_code)
+        
+        # Check for missing intermediate levels and broader/narrower consistency
+        for code, uri in code_to_uri.items():
+            prefixes = self._code_prefixes(code)
+            if not prefixes:
+                continue
+            # Missing intermediate levels (segment-aware)
+            for parent_prefix in prefixes:
+                if parent_prefix not in all_codes:
+                    warnings.append(
+                        f"Hierarchy gap: <{uri}> (code {code}) is missing intermediate level concept '{parent_prefix}'. "
+                        f"Suggestion: Add concept '{parent_prefix}' or adjust codes to reflect intended hierarchy."
+                    )
+            # Broader should reference some existing prefix of the code (not necessarily immediate)
+            broader_codes = broader_map.get(code, set())
+            prefix_candidates = {p for p in prefixes if p in all_codes}
+            if prefix_candidates and not (broader_codes & prefix_candidates):
+                broader_uris = [code_to_uri.get(bc, f"<{bc}>") for bc in sorted(broader_codes)] or ['—']
+                candidate_uris = [code_to_uri.get(c, f"<{c}>") for c in sorted(prefix_candidates)]
+                violations.append(
+                    f"Inconsistent hierarchy: <{uri}> (code {code}) has no skos:broader to any prefix among {candidate_uris}. "
+                    f"Found broader targets: {', '.join(broader_uris)}. "
+                    f"Suggestion: Add a skos:broader to one of its prefix concepts (e.g., {candidate_uris[0]})."
+                )
+            
+            # Optional: for each actual broader that is a prefix, ensure reverse narrower is present
+            for parent_code in (broader_codes & prefix_candidates):
+                parent_uri = code_to_uri.get(parent_code, f"<{parent_code}>")
+                parent_narrowers = narrower_map.get(parent_code, set())
+                if self.warn_missing_narrower and code not in parent_narrowers:
+                    infos.append(
+                        f"Parent missing skos:narrower: {parent_uri} should include <{uri}> (code {code}) as narrower. "
+                        f"Suggestion: Add 'skos:narrower <{uri}>' to parent."
+                    )
+        
+        # Record info-level findings centrally for reporting
+        if infos:
+            self.validation_infos.extend(infos)
+        return violations, warnings
+    
     def _extract_uri_from_property(self, prop: str) -> Optional[str]:
         """Extract URI from a property string like 'skos:broader <uri>'."""
         # Match URIs in angle brackets
@@ -673,6 +1030,14 @@ class TTLCleaner:
         if match:
             return f"<{match.group(1)}>"
         return None
+    
+    def _extract_uris_from_property(self, prop: str) -> List[str]:
+        """Extract all URIs from a property string like 'skos:narrower <a>, <b>, <c>'.
+        Returns tokens wrapped in angle brackets to match existing expectations, e.g., ['<a>', '<b>'].
+        """
+        if not prop:
+            return []
+        return [f"<{u}>" for u in re.findall(r'<([^>]+)>', prop)]
     
     def _compute_transitive_closure(self, relations: Set[Tuple[str, str]]) -> Set[Tuple[str, str]]:
         """Compute transitive closure of relations - fixed to prevent dictionary iteration errors."""
@@ -749,12 +1114,19 @@ class TTLCleaner:
         pattern = r'^[a-z]{2,3}(-[A-Za-z0-9]{1,8})*$'
         return bool(re.match(pattern, tag))
     
-    def _generate_validation_report(self, violations: List[str], warnings: List[str]) -> str:
+    def _generate_validation_report(self, violations: List[str], warnings: List[str], infos: Optional[List[str]] = None) -> str:
         """Generate detailed validation report."""
         report = []
         report.append("\n" + "="*60)
         report.append("SKOS VALIDATION REPORT")
         report.append("="*60)
+        
+        # Always include summary by check (even if all zeros)
+        infos = infos or []
+        summary = self._summarize_validation_counts(violations, warnings, infos)
+        report.append("\nSUMMARY BY CHECK:")
+        for name, count in summary.items():
+            report.append(f"- {name}: {count}")
         
         if violations:
             report.append(f"\nINTEGRITY VIOLATIONS ({len(violations)}):")
@@ -766,11 +1138,43 @@ class TTLCleaner:
             for i, warning in enumerate(warnings, 1):
                 report.append(f"  {i:3d}. {warning}")
         
-        if not violations and not warnings:
+        if infos:
+            report.append(f"\nINFOS ({len(infos)}):")
+            for i, info in enumerate(infos, 1):
+                report.append(f"  {i:3d}. {info}")
+        
+        if not violations and not warnings and not infos:
             report.append("\n✅ All SKOS integrity conditions satisfied!")
         
         report.append("\n" + "="*60)
         return "\n".join(report)
+
+    def _summarize_validation_counts(self, violations: List[str], warnings: List[str], infos: Optional[List[str]] = None) -> Dict[str, int]:
+        """Summarize counts per known check category. Always returns all categories with zero when absent."""
+        categories = [
+            ("S14 prefLabel duplicates", lambda s: s.startswith("S14 Violation")),
+            ("S13 pref/alt overlap", lambda s: s.startswith("S13 Violation")),
+            ("URI format invalid", lambda s: s.startswith("Invalid URI format")),
+            ("Language tag possibly invalid", lambda s: "Potentially invalid language tag" in s),
+            ("S27 broader+related conflict", lambda s: s.startswith("S27 Violation")),
+            ("Simple hierarchy cycles", lambda s: s.startswith("Simple cycle detected")),
+            ("Hierarchy gap (missing intermediate level)", lambda s: s.startswith("Hierarchy gap")),
+            ("Hierarchy: missing broader to prefix", lambda s: s.startswith("Inconsistent hierarchy")),
+            ("Hierarchy: parent missing narrower", lambda s: s.startswith("Parent missing skos:narrower")),
+            ("Scheme: topConceptOf without inScheme", lambda s: "has topConceptOf" in s and "missing inScheme" in s),
+            ("Scheme: hasTopConcept -> non-Concept", lambda s: "hasTopConcept points to non-Concept" in s),
+            ("Scheme: hasTopConcept target missing inScheme", lambda s: "is hasTopConcept of" in s and "missing inScheme" in s),
+            ("Label warning: very long", lambda s: s.startswith("Very long label")),
+            ("Label warning: empty", lambda s: s.startswith("Empty label")),
+            ("Label warning: encoding issue", lambda s: s.startswith("Potential encoding issue")),
+            ("Label warning: looks like URI", lambda s: s.startswith("Label looks like URI")),
+        ]
+        infos = infos or []
+        all_msgs = list(violations) + list(warnings) + list(infos)
+        summary: Dict[str, int] = {}
+        for name, predicate in categories:
+            summary[name] = sum(1 for msg in all_msgs if predicate(msg))
+        return summary
     
     def _clean_uri(self, uri: str) -> str:
         """Clean and normalize URI."""
@@ -1051,7 +1455,7 @@ class TTLCleaner:
                 
         print(f"[OK] Change log written: {log_path}")
     
-    def _write_validation_report(self, log_path: str, violations: List[str], warnings: List[str]) -> None:
+    def _write_validation_report(self, log_path: str, violations: List[str], warnings: List[str], infos: Optional[List[str]] = None) -> None:
         """Write detailed validation report to file."""
         from datetime import datetime
         
@@ -1064,6 +1468,13 @@ class TTLCleaner:
             f.write(f"SUMMARY:\n")
             f.write(f"- Integrity violations: {len(violations)}\n")
             f.write(f"- Warnings: {len(warnings)}\n")
+            infos = infos or []
+            f.write(f"- Infos: {len(infos)}\n")
+            # Add summary by check
+            summary = self._summarize_validation_counts(violations, warnings, infos)
+            f.write("- By check (including zeros):\n")
+            for name, count in summary.items():
+                f.write(f"  - {name}: {count}\n")
             f.write(f"\n")
             
             # Violations
@@ -1082,10 +1493,98 @@ class TTLCleaner:
                     f.write(f"{i:4d}. {warning}\n")
                 f.write(f"\n")
             
-            if not violations and not warnings:
+            # Infos
+            if infos:
+                f.write(f"INFOS ({len(infos)}):\n")
+                f.write(f"-" * 40 + "\n")
+                for i, info in enumerate(infos, 1):
+                    f.write(f"{i:4d}. {info}\n")
+                f.write(f"\n")
+            
+            if not violations and not warnings and not infos:
                 f.write("SUCCESS: All SKOS integrity conditions satisfied!\n")
                 
         print(f"[OK] Validation report written: {log_path}")
+    
+    def _write_combined_report(self, log_path: str, input_path: str, output_path: str, violations: List[str], warnings: List[str], infos: Optional[List[str]] = None) -> None:
+        """Write a single combined logfile with stats, errors, change log, and validation results."""
+        from datetime import datetime
+        with open(log_path, 'w', encoding='utf-8') as f:
+            f.write("TTL CLEANER FULL REPORT\n")
+            f.write(f"Generated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
+            f.write("="*60 + "\n\n")
+            
+            # Files
+            f.write("FILES:\n")
+            f.write(f"- Input:  {input_path}\n")
+            f.write(f"- Output: {output_path}\n\n")
+            
+            # Stats summary
+            f.write("STATISTICS:\n")
+            f.write(f"- Total concepts processed: {self.stats['total_concepts']}\n")
+            f.write(f"- Duplicates removed: {self.stats['duplicates_removed']}\n")
+            f.write(f"- Concepts without prefLabel: {self.stats['concepts_without_preflabel']}\n")
+            f.write(f"- Malformed URIs fixed: {self.stats['malformed_uris_fixed']}\n")
+            f.write(f"- Labels processed: {self.stats['labels_processed']}\n")
+            f.write(f"- Comma spacing fixes: {self.stats['comma_fixes']}\n")
+            f.write(f"- Text fields cleaned: {self.stats['text_fields_cleaned']}\n\n")
+            
+            # Cleaning errors/warnings
+            if self.errors:
+                f.write(f"ERRORS DURING CLEANING ({len(self.errors)}):\n")
+                f.write("-"*40 + "\n")
+                for i, err in enumerate(self.errors, 1):
+                    f.write(f"{i:4d}. {err}\n")
+                f.write("\n")
+            if self.warnings:
+                f.write(f"WARNINGS DURING CLEANING ({len(self.warnings)}):\n")
+                f.write("-"*40 + "\n")
+                for i, warn in enumerate(self.warnings, 1):
+                    f.write(f"{i:4d}. {warn}\n")
+                f.write("\n")
+            
+            # Change log
+            if self.change_log:
+                f.write(f"CHANGE LOG ({len(self.change_log)} entries):\n")
+                f.write("-"*40 + "\n")
+                for i, change in enumerate(self.change_log, 1):
+                    f.write(f"{i:4d}. {change}\n")
+                f.write("\n")
+            
+            # Validation
+            f.write("VALIDATION RESULTS:\n")
+            f.write(f"- Violations: {len(violations)}\n")
+            f.write(f"- Warnings:   {len(warnings)}\n")
+            infos = infos or []
+            f.write(f"- Infos:      {len(infos)}\n\n")
+            # Add summary by check
+            summary = self._summarize_validation_counts(violations, warnings, infos)
+            f.write("- By check (including zeros):\n")
+            for name, count in summary.items():
+                f.write(f"  - {name}: {count}\n")
+            f.write("\n")
+            if violations:
+                f.write(f"VIOLATIONS ({len(violations)}):\n")
+                f.write("-"*40 + "\n")
+                for i, v in enumerate(violations, 1):
+                    f.write(f"{i:4d}. {v}\n")
+                f.write("\n")
+            if warnings:
+                f.write(f"WARNINGS ({len(warnings)}):\n")
+                f.write("-"*40 + "\n")
+                for i, w in enumerate(warnings, 1):
+                    f.write(f"{i:4d}. {w}\n")
+                f.write("\n")
+            if infos:
+                f.write(f"INFOS ({len(infos)}):\n")
+                f.write("-"*40 + "\n")
+                for i, info in enumerate(infos, 1):
+                    f.write(f"{i:4d}. {info}\n")
+                f.write("\n")
+            if not violations and not warnings and not infos:
+                f.write("SUCCESS: All SKOS integrity conditions satisfied!\n")
+        
+        print(f"[OK] Full report written: {log_path}")
     
     def _clean_concepts_chunked(self, concepts: List[Dict]) -> List[Dict]:
         """Clean concepts in chunks for memory efficiency."""
@@ -1142,7 +1641,26 @@ class TTLCleaner:
             if self.memory_efficient:
                 import gc
                 gc.collect()
-        
+        # After per-chunk validations, run hierarchy gap validation across all concepts (needs global view)
+        try:
+            print("[INFO] Running global hierarchy validation across all chunks...")
+            violations, warnings = self._validate_hierarchy_gaps(concepts)
+            all_violations.extend(violations)
+            all_warnings.extend(warnings)
+        except Exception as e:
+            print(f"[DEBUG] Error in global hierarchy validation: {e}")
+            raise
+
+        # Also run scheme consistency validation across all concepts to mirror non-chunked path
+        try:
+            print("[INFO] Running scheme consistency validation across all chunks...")
+            violations, warnings = self._validate_scheme_consistency(concepts)
+            all_violations.extend(violations)
+            all_warnings.extend(warnings)
+        except Exception as e:
+            print(f"[DEBUG] Error in scheme consistency validation: {e}")
+            raise
+
         return all_violations, all_warnings
     
     def _validate_skos_xl_labels(self, concepts: List[Dict]) -> Tuple[List[str], List[str]]:
@@ -1353,7 +1871,7 @@ Examples:
   python ttl_cleaner.py input.ttl --no-reports
 
 Default Output:
-  input.ttl -> input_cleaned.ttl + input_cleaned_validation.log + input_cleaned_changes.log
+  input.ttl -> input_cleaned.ttl + input_cleaned_validation.log + input_cleaned_changes.log + input_cleaned_full.log
 """
     )
     
@@ -1372,6 +1890,10 @@ Default Output:
                        help='Disable SKOS validation for faster processing')
     parser.add_argument('--enable-skos-xl', action='store_true',
                        help='Enable SKOS-XL label validation')
+    parser.add_argument('--autofix-broader', action='store_true',
+                       help='Automatically add missing skos:broader to the nearest prefix parent')
+    parser.add_argument('--warn-missing-narrower', action='store_true',
+                       help='Report info-level messages when a parent lacks explicit skos:narrower back-link')
     
     # Output options
     parser.add_argument('--no-reports', action='store_true',
@@ -1384,7 +1906,9 @@ Default Output:
         chunk_size=args.chunk_size,
         enable_validation=not args.no_validation,
         memory_efficient=args.memory_efficient,
-        enable_skos_xl=args.enable_skos_xl
+        enable_skos_xl=args.enable_skos_xl,
+        autofix_broader=args.autofix_broader,
+        warn_missing_narrower=args.warn_missing_narrower
     )
     
     # Print configuration if verbose
@@ -1393,6 +1917,8 @@ Default Output:
         print(f"[CONFIG] Memory efficient: {args.memory_efficient}")
         print(f"[CONFIG] Validation enabled: {not args.no_validation}")
         print(f"[CONFIG] SKOS-XL enabled: {args.enable_skos_xl}")
+        print(f"[CONFIG] Autofix broader: {args.autofix_broader}")
+        print(f"[CONFIG] Warn missing narrower (info): {args.warn_missing_narrower}")
         print(f"[CONFIG] Reports enabled: {not args.no_reports}")
         print()
     
@@ -1415,6 +1941,7 @@ Default Output:
             print(f"\nVALIDATION RESULTS:")
             print(f"  Violations: {len(cleaner.validation_violations)}")
             print(f"  Warnings: {len(cleaner.validation_warnings)}")
+            print(f"  Infos: {len(cleaner.validation_infos)}")
             
             if cleaner.validation_violations:
                 print(f"  WARNING: Found {len(cleaner.validation_violations)} SKOS integrity violations!")
