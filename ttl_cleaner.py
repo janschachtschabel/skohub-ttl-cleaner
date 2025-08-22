@@ -29,6 +29,7 @@ class TTLCleaner:
             'total_concepts': 0,
             'duplicates_removed': 0,
             'malformed_uris_fixed': 0,
+            'uri_normalizations': 0,
             'encoding_issues_fixed': 0,
             'text_fields_cleaned': 0,
             'labels_processed': 0,
@@ -393,10 +394,18 @@ class TTLCleaner:
         uri_match = re.search(r'^(<[^>]+>|[a-zA-Z0-9_:/-]+)\s+a\s+skos:Concept', block, re.MULTILINE)
         if uri_match:
             raw_uri = uri_match.group(1).strip()
-            concept['uri'] = self._clean_uri(raw_uri)
-            if raw_uri != concept['uri']:
-                concept['issues'].append('URI cleaned')
-                self.stats['malformed_uris_fixed'] += 1
+            cleaned_uri = self._clean_uri(raw_uri)
+            concept['uri'] = cleaned_uri
+            if raw_uri != cleaned_uri:
+                # Classify and log URI change; only count and log when classifier provides a message
+                is_fix, msg = self._classify_uri_change(raw_uri, cleaned_uri)
+                if msg:
+                    concept['issues'].append('URI fixed' if is_fix else 'URI normalized')
+                    self.change_log.append(msg)
+                    if is_fix:
+                        self.stats['malformed_uris_fixed'] += 1
+                    else:
+                        self.stats['uri_normalizations'] += 1
         else:
             concept['issues'].append('No URI found')
             return None
@@ -408,12 +417,38 @@ class TTLCleaner:
             if cleaned_label:
                 concept['prefLabels'].append({'text': cleaned_label, 'lang': lang or 'en'})
         
+        # Also capture comma-separated multi-object prefLabel lists across lines
+        # Example: skos:prefLabel "Foo"@de , "Bar"@en ;
+        for m in re.finditer(r'skos:prefLabel\s+', block):
+            tail = block[m.end():]
+            end_match = re.search(r'[;\.]', tail)
+            segment = tail[:end_match.start()] if end_match else tail
+            for lbl, lng in re.findall(r'"([^"]+)"(?:@([a-z]{2}))?', segment):
+                cleaned = self._clean_label(lbl)
+                if cleaned:
+                    entry = {'text': cleaned, 'lang': lng or 'en'}
+                    if entry not in concept['prefLabels']:
+                        concept['prefLabels'].append(entry)
+        
         # Extract altLabels
         alt_labels = re.findall(r'skos:altLabel\s+"([^"]+)"(?:@([a-z]{2}))?', block)
         for label, lang in alt_labels:
             cleaned_label = self._clean_label(label)
             if cleaned_label:
                 concept['altLabels'].append({'text': cleaned_label, 'lang': lang or 'en'})
+        
+        # Also capture comma-separated multi-object altLabel lists across lines
+        # Example: skos:altLabel "Alt 1"@de , "Alt 2"@de ;
+        for m in re.finditer(r'skos:altLabel\s+', block):
+            tail = block[m.end():]
+            end_match = re.search(r'[;\.]', tail)
+            segment = tail[:end_match.start()] if end_match else tail
+            for lbl, lng in re.findall(r'"([^"]+)"(?:@([a-z]{2}))?', segment):
+                cleaned = self._clean_label(lbl)
+                if cleaned:
+                    entry = {'text': cleaned, 'lang': lng or 'en'}
+                    if entry not in concept['altLabels']:
+                        concept['altLabels'].append(entry)
         
         # Extract definitions
         definitions = re.findall(r'skos:definition\s+"([^"]+)"(?:@([a-z]{2}))?', block)
@@ -504,13 +539,8 @@ class TTLCleaner:
                 i += 1
                 continue
             
-            # Check if this line starts a SKOS property
-            if ':' in line and any(line.strip().startswith(prop) for prop in [
-                'skos:exactMatch', 'skos:narrower', 'skos:broader', 'skos:broaderTransitive',
-                'skos:related', 'skos:closeMatch', 'skos:exactMatch', 'skos:broadMatch',
-                'skos:narrowMatch', 'skos:relatedMatch', 'skos:inScheme', 'skos:topConceptOf',
-                'skos:hasTopConcept', 'skos:member', 'skos:memberList'
-            ]):
+            # Check if this line starts a property (retain all non-text properties like skos:notation, dct:source, etc.)
+            if ':' in line:
                 # Start collecting the complete property (may span multiple lines)
                 property_lines = []
                 current_line = line
@@ -1204,6 +1234,52 @@ class TTLCleaner:
                     uri = f"http://data.europa.eu/esco/skill/{uri}"
         
         return uri
+
+    def _classify_uri_change(self, raw_uri: str, cleaned_uri: str) -> Tuple[bool, str]:
+        """Determine whether a URI change is a real fix or just normalization.
+        Returns (is_fix, message). Normalizations are not counted as fixes but are logged.
+        Criteria:
+        - Angle bracket removal and @base-relative resolution are treated as normalization.
+        - Expanding known/unknown prefixes to http is treated as a fix.
+        - Adding a default namespace when no @base/prefix is present is treated as a fix.
+        """
+        raw = raw_uri.strip()
+        # Extract inner value if enclosed in angle brackets
+        raw_inner = raw[1:-1] if raw.startswith('<') and raw.endswith('>') else raw
+
+        # Case 1: angle brackets around an absolute URI -> normalization only
+        if raw.startswith('<') and raw.endswith('>') and raw_inner.startswith('http'):
+            return (False, f"URI normalized (angle brackets removed): {raw}")
+
+        # Case 2: relative with @base
+        # If resolving with @base yields the same absolute URI we computed, and
+        # the final output will be rendered as the same relative token again, suppress logging (treat as no-op).
+        if self.base_uri and (not raw_inner.startswith('http')) and (':' not in raw_inner):
+            expected_abs = f"{self.base_uri.rstrip('/')}/{raw_inner.strip('<>')}"
+            if expected_abs == cleaned_uri:
+                # No effective change for the final TTL (will be rendered as <relative> again)
+                return (False, "")
+            # Otherwise, still a normalization
+            return (False, f"URI normalized using @base: {raw} -> <{cleaned_uri}>")
+
+        # Case 3: prefixed name expanded (e.g., esco:123) -> count as fix
+        if (':' in raw_inner) and (not raw_inner.startswith('http')):
+            return (True, f"URI fixed: expanded prefix '{raw_inner}' -> <{cleaned_uri}>")
+
+        # Case 4: no scheme and no @base, defaulted to namespace -> count as fix
+        if (not raw_inner.startswith('http')) and not self.base_uri:
+            return (True, f"URI fixed: added default namespace -> <{cleaned_uri}> from '{raw}'")
+
+        # Case 5: whitespace-only cleanup -> normalization
+        if raw != raw_uri:
+            return (False, f"URI normalized (whitespace trimmed): '{raw_uri}' -> '{raw}'")
+
+        # Fallback: if changed but no specific rule matched, treat as normalization
+        if raw != cleaned_uri:
+            return (False, f"URI normalized: {raw} -> <{cleaned_uri}>")
+
+        # No change
+        return (False, "")
     
     def _clean_label(self, label: str) -> Optional[str]:
         """Clean label text."""
@@ -1227,9 +1303,26 @@ class TTLCleaner:
         
         if label != original_label:
             self.stats['encoding_issues_fixed'] += 1
+            # Log label cleaning (truncate to avoid overly long lines)
+            old = original_label.strip()
+            new = label.strip()
+            if len(old) > 120:
+                old = old[:117] + '...'
+            if len(new) > 120:
+                new = new[:117] + '...'
+            self.change_log.append(f"Label cleaned: '{old}' -> '{new}'")
         
-        # Remove extra whitespace
+        # Remove extra whitespace (log when whitespace-only normalization happens)
+        before_ws = label
         label = ' '.join(label.split())
+        if label != before_ws and before_ws == original_label:
+            old = before_ws.strip()
+            new = label.strip()
+            if len(old) > 120:
+                old = old[:117] + '...'
+            if len(new) > 120:
+                new = new[:117] + '...'
+            self.change_log.append(f"Label normalized (whitespace): '{old}' -> '{new}'")
         
         # Remove empty labels
         if not label.strip():
@@ -1279,9 +1372,16 @@ class TTLCleaner:
         # Remove leading/trailing whitespace
         text = text.strip()
         
-        # Track changes
+        # Track changes (count as text field cleaned)
         if text != original_text:
-            self.stats['encoding_issues_fixed'] += 1
+            self.stats['text_fields_cleaned'] += 1
+            old = original_text.strip()
+            new = text.strip()
+            if len(old) > 120:
+                old = old[:117] + '...'
+            if len(new) > 120:
+                new = new[:117] + '...'
+            self.change_log.append(f"Text field cleaned: '{old}' -> '{new}'")
         
         # Remove empty text
         if not text.strip():
@@ -1320,6 +1420,14 @@ class TTLCleaner:
         # Track comma fixes only if text actually changed
         if text != original_text:
             self.stats['comma_fixes'] += 1
+            self.stats['text_fields_cleaned'] += 1
+            old = original_text.strip()
+            new = text.strip()
+            if len(old) > 120:
+                old = old[:117] + '...'
+            if len(new) > 120:
+                new = new[:117] + '...'
+            self.change_log.append(f"Comma spacing fixed: '{old}' -> '{new}'")
         
         return text
     
@@ -1443,7 +1551,9 @@ class TTLCleaner:
             f.write(f"SUMMARY:\n")
             f.write(f"- Total concepts processed: {self.stats['total_concepts']}\n")
             f.write(f"- Duplicates removed: {self.stats['duplicates_removed']}\n")
-            f.write(f"- Labels processed: {self.stats['labels_processed']}\n")
+            f.write(f"- Malformed URIs fixed: {self.stats['malformed_uris_fixed']}\n")
+            f.write(f"- URI normalizations (e.g., @base, <...>): {self.stats['uri_normalizations']}\n")
+            f.write(f"- Labels checked: {self.stats['labels_processed']}\n")
             f.write(f"- Comma spacing fixes: {self.stats['comma_fixes']}\n")
             f.write(f"\n")
             
@@ -1452,6 +1562,8 @@ class TTLCleaner:
             f.write(f"-" * 40 + "\n")
             for i, change in enumerate(self.change_log, 1):
                 f.write(f"{i:4d}. {change}\n")
+            if not self.change_log:
+                f.write("(No detailed change entries)\n")
                 
         print(f"[OK] Change log written: {log_path}")
     
@@ -1525,7 +1637,8 @@ class TTLCleaner:
             f.write(f"- Duplicates removed: {self.stats['duplicates_removed']}\n")
             f.write(f"- Concepts without prefLabel: {self.stats['concepts_without_preflabel']}\n")
             f.write(f"- Malformed URIs fixed: {self.stats['malformed_uris_fixed']}\n")
-            f.write(f"- Labels processed: {self.stats['labels_processed']}\n")
+            f.write(f"- URI normalizations (e.g., @base, <...>): {self.stats['uri_normalizations']}\n")
+            f.write(f"- Labels checked: {self.stats['labels_processed']}\n")
             f.write(f"- Comma spacing fixes: {self.stats['comma_fixes']}\n")
             f.write(f"- Text fields cleaned: {self.stats['text_fields_cleaned']}\n\n")
             
@@ -1544,12 +1657,13 @@ class TTLCleaner:
                 f.write("\n")
             
             # Change log
-            if self.change_log:
-                f.write(f"CHANGE LOG ({len(self.change_log)} entries):\n")
-                f.write("-"*40 + "\n")
-                for i, change in enumerate(self.change_log, 1):
-                    f.write(f"{i:4d}. {change}\n")
-                f.write("\n")
+            f.write(f"CHANGE LOG ({len(self.change_log)} entries):\n")
+            f.write("-"*40 + "\n")
+            for i, change in enumerate(self.change_log, 1):
+                f.write(f"{i:4d}. {change}\n")
+            if not self.change_log:
+                f.write("(No detailed change entries)\n")
+            f.write("\n")
             
             # Validation
             f.write("VALIDATION RESULTS:\n")
@@ -1741,7 +1855,6 @@ class TTLCleaner:
             fixed_text = self._fix_comma_spacing(definition['text'])
             all_properties.append(f'skos:definition "{fixed_text}"{lang_tag}')
             self.stats['definitions_processed'] += 1
-            self.stats['text_fields_cleaned'] += 1
         
         # Add notes
         for note in concept['notes']:
@@ -1749,7 +1862,6 @@ class TTLCleaner:
             fixed_text = self._fix_comma_spacing(note['text'])
             all_properties.append(f'skos:note "{fixed_text}"{lang_tag}')
             self.stats['notes_processed'] += 1
-            self.stats['text_fields_cleaned'] += 1
         
         # Add scopeNotes
         for note in concept['scopeNotes']:
@@ -1757,7 +1869,6 @@ class TTLCleaner:
             fixed_text = self._fix_comma_spacing(note['text'])
             all_properties.append(f'skos:scopeNote "{fixed_text}"{lang_tag}')
             self.stats['notes_processed'] += 1
-            self.stats['text_fields_cleaned'] += 1
         
         # Add editorialNotes
         for note in concept['editorialNotes']:
@@ -1765,7 +1876,6 @@ class TTLCleaner:
             fixed_text = self._fix_comma_spacing(note['text'])
             all_properties.append(f'skos:editorialNote "{fixed_text}"{lang_tag}')
             self.stats['notes_processed'] += 1
-            self.stats['text_fields_cleaned'] += 1
         
         # Add historyNotes
         for note in concept['historyNotes']:
@@ -1773,7 +1883,6 @@ class TTLCleaner:
             fixed_text = self._fix_comma_spacing(note['text'])
             all_properties.append(f'skos:historyNote "{fixed_text}"{lang_tag}')
             self.stats['notes_processed'] += 1
-            self.stats['text_fields_cleaned'] += 1
         
         # Add changeNotes
         for note in concept['changeNotes']:
@@ -1781,14 +1890,13 @@ class TTLCleaner:
             fixed_text = self._fix_comma_spacing(note['text'])
             all_properties.append(f'skos:changeNote "{fixed_text}"{lang_tag}')
             self.stats['notes_processed'] += 1
-            self.stats['text_fields_cleaned'] += 1
         
         # Add examples
         for example in concept['examples']:
             lang_tag = f"@{example['lang']}" if example['lang'] else ""
             fixed_text = self._fix_comma_spacing(example['text'])
             all_properties.append(f'skos:example "{fixed_text}"{lang_tag}')
-            self.stats['text_fields_cleaned'] += 1
+            # text_fields_cleaned is incremented inside _fix_comma_spacing only when changes occur
         
         # Add other SKOS properties
         for prop in concept['other_properties']:
@@ -1821,7 +1929,7 @@ class TTLCleaner:
         print(f"   Empty labels removed: {self.stats['empty_labels_removed']}")
         print(f"   Text fields cleaned: {self.stats['text_fields_cleaned']}")
         print(f"   Comma spacing fixes: {self.stats['comma_fixes']}")
-        print(f"   Labels processed: {self.stats['labels_processed']}")
+        print(f"   Labels checked: {self.stats['labels_processed']}")
         print(f"   Definitions processed: {self.stats['definitions_processed']}")
         print(f"   Notes processed: {self.stats['notes_processed']}")
         
