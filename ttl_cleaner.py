@@ -20,11 +20,12 @@ from pathlib import Path
 from typing import Dict, List, Set, Tuple, Optional
 from collections import defaultdict, Counter
 import urllib.parse
+import shutil
 
 class TTLCleaner:
     """Clean and validate TTL files with SKOS integrity checks and performance optimizations."""
     
-    def __init__(self, chunk_size=1000, enable_validation=True, memory_efficient=False, enable_skos_xl=False, autofix_broader=False, warn_missing_narrower: bool = False):
+    def __init__(self, chunk_size=1000, enable_validation=True, memory_efficient=False, enable_skos_xl=False, autofix_broader=False, warn_missing_narrower: bool = False, preserve_byte_identity: bool = False, semantic_check: bool = False):
         self.stats = {
             'total_concepts': 0,
             'duplicates_removed': 0,
@@ -69,6 +70,11 @@ class TTLCleaner:
         # If True, warn when a parent lacks explicit skos:narrower for an existing in-branch broader link
         # Default False to avoid noisy, non-mandatory warnings (inverse can be inferred by consumers)
         self.warn_missing_narrower = warn_missing_narrower
+
+        # Output behavior
+        self.preserve_byte_identity = preserve_byte_identity
+        # Semantic graph comparison (rdflib isomorphism)
+        self.semantic_check = semantic_check
 
     def clean_ttl_file(self, input_path: str, output_path: Optional[str] = None, generate_reports: bool = True) -> bool:
         """Clean TTL file and save cleaned version."""
@@ -190,8 +196,32 @@ class TTLCleaner:
                 input_file = Path(input_path)
                 output_path = input_file.parent / f"{input_file.stem}_cleaned{input_file.suffix}"
 
-            # Write cleaned file
-            self._write_cleaned_file(cleaned_concepts, content, output_path)
+            # Write cleaned file (with optional passthrough to preserve original bytes if no transformations)
+            self._write_cleaned_file(cleaned_concepts, content, output_path, input_path)
+
+            # Optional semantic graph isomorphism check (rdflib)
+            if getattr(self, 'semantic_check', False):
+                try:
+                    isomorphic, n_in, n_out = self._semantic_isomorphic_check(input_path, output_path)
+                    if isomorphic:
+                        msg = (
+                            f"Semantic check: No semantic differences. "
+                            f"Original and cleaned TTL describe the same RDF graph (isomorphic). "
+                            f"Triples: {n_in} = {n_out}"
+                        )
+                    else:
+                        msg = (
+                            f"Semantic check: Semantic differences detected. "
+                            f"Graphs are not equivalent (not isomorphic). "
+                            f"Triples: {n_in} vs {n_out}"
+                        )
+                    # Record as info so it appears in reports
+                    self.validation_infos.append(msg)
+                    print(f"[INFO] {msg}")
+                except Exception as e:
+                    warn = f"Semantic check failed: {e}"
+                    self.warnings.append(warn)
+                    print(f"[WARN] {warn}")
 
             # Generate report
             self._print_report(input_path, output_path)
@@ -1359,8 +1389,15 @@ class TTLCleaner:
         text = re.sub(r'\.(?!\s|$|\d)', '. ', text)
         # Add space after semicolons if missing
         text = re.sub(r';(?!\s)', '; ', text)
-        # Add space after colons if missing
+        # Add space after colons if missing, but preserve gender-colon forms and numeric ratios like 1:1
+        # Protect numeric ratios (e.g., 1:1, 10:30)
+        text = re.sub(r'(\d+):(\d+)', r'\1<NO_SPACE_COLON>\2', text)
+        # Protect German gender-colon forms (:in, :innen)
+        text = re.sub(r'(?i)([A-Za-zÄÖÜäöüß][\wÄÖÜäöüß-]*)\:(in|innen)\b', r'\1<NO_SPACE_COLON>\2', text)
+        # Now add space after remaining colons
         text = re.sub(r':(?!\s|$)', ': ', text)
+        # Restore protected colons
+        text = text.replace('<NO_SPACE_COLON>', ':')
         # Add space after exclamation marks if missing
         text = re.sub(r'!(?!\s|$)', '! ', text)
         # Add space after question marks if missing
@@ -1404,8 +1441,15 @@ class TTLCleaner:
         text = re.sub(r'\.(?!\s|$|\d)', '. ', text)
         # Add space after semicolons if missing
         text = re.sub(r';(?!\s)', '; ', text)
-        # Add space after colons if missing (but not at end)
+        # Add space after colons if missing (but not at end), preserving gender-colon forms and numeric ratios
+        # Protect numeric ratios (e.g., 1:1, 10:30)
+        text = re.sub(r'(\d+):(\d+)', r'\1<NO_SPACE_COLON>\2', text)
+        # Protect German gender-colon forms (:in, :innen)
+        text = re.sub(r'(?i)([A-Za-zÄÖÜäöüß][\wÄÖÜäöüß-]*)\:(in|innen)\b', r'\1<NO_SPACE_COLON>\2', text)
+        # Now add space after remaining colons
         text = re.sub(r':(?!\s|$)', ': ', text)
+        # Restore protected colons
+        text = text.replace('<NO_SPACE_COLON>', ':')
         # Add space after exclamation marks if missing (but not at end)
         text = re.sub(r'!(?!\s|$)', '! ', text)
         # Add space after question marks if missing (but not at end)
@@ -1528,15 +1572,55 @@ class TTLCleaner:
         
         return '\n'.join(lines)
     
-    def _write_cleaned_file(self, concepts: List[Dict], original_content: str, output_path: str):
-        """Write cleaned concepts to new TTL file."""
+    def _write_cleaned_file(self, concepts: List[Dict], original_content: str, output_path: str, input_path: Optional[str] = None):
+        """Write cleaned concepts to new TTL file.
+        If preserve_byte_identity is enabled and no transformations occurred, copy original bytes to output.
+        """
+        # Determine if we should passthrough original bytes
+        do_passthrough = False
+        if getattr(self, 'preserve_byte_identity', False) and self._no_transformations_made():
+            do_passthrough = True
+
+        if do_passthrough and input_path:
+            # Binary copy to preserve exact bytes
+            try:
+                shutil.copyfile(input_path, output_path)
+                print(f"[OK] Passthrough enabled: original bytes copied to {output_path}")
+                return
+            except Exception as e:
+                print(f"[WARN] Passthrough failed ({e}), falling back to regenerated content")
+                # Fall back to regenerated content below
+
         cleaned_content = self._generate_cleaned_content(concepts, original_content)
-        
-        # Write to file
+
+        # Write regenerated content
         with open(output_path, 'w', encoding='utf-8') as f:
             f.write(cleaned_content)
         
         print(f"[OK] Cleaned file saved: {output_path}")
+
+    def _no_transformations_made(self) -> bool:
+        """Return True if cleaning made no substantive changes that would affect bytes.
+        We consider:
+          - No entries in change_log
+          - No removals/fixes/normalizations/spacing fixes/text cleanups
+          - No concepts dropped due to missing prefLabel
+          - Autofix broader not applied
+        """
+        if self.autofix_broader:
+            return False
+
+        zero_stats = (
+            self.stats.get('duplicates_removed', 0) == 0 and
+            self.stats.get('malformed_uris_fixed', 0) == 0 and
+            self.stats.get('uri_normalizations', 0) == 0 and
+            self.stats.get('encoding_issues_fixed', 0) == 0 and
+            self.stats.get('empty_labels_removed', 0) == 0 and
+            self.stats.get('comma_fixes', 0) == 0 and
+            self.stats.get('text_fields_cleaned', 0) == 0 and
+            self.stats.get('concepts_without_preflabel', 0) == 0
+        )
+        return zero_stats and not self.change_log
     
     def _write_change_log(self, log_path: str) -> None:
         """Write detailed change log to file."""
@@ -1699,6 +1783,21 @@ class TTLCleaner:
                 f.write("SUCCESS: All SKOS integrity conditions satisfied!\n")
         
         print(f"[OK] Full report written: {log_path}")
+
+    def _semantic_isomorphic_check(self, input_path: str, output_path: str) -> Tuple[bool, int, int]:
+        """Load input and output TTL with rdflib and check graph isomorphism.
+        Returns tuple: (isomorphic, triples_input, triples_output).
+        """
+        try:
+            from rdflib import Graph
+        except Exception as e:
+            raise RuntimeError(f"rdflib not available: {e}")
+
+        g1 = Graph()
+        g1.parse(input_path, format='turtle')
+        g2 = Graph()
+        g2.parse(output_path, format='turtle')
+        return (g1.isomorphic(g2), len(g1), len(g2))
     
     def _clean_concepts_chunked(self, concepts: List[Dict]) -> List[Dict]:
         """Clean concepts in chunks for memory efficiency."""
@@ -2006,6 +2105,10 @@ Default Output:
     # Output options
     parser.add_argument('--no-reports', action='store_true',
                        help='Skip generating validation and change reports')
+    parser.add_argument('--preserve-byte-identity', action='store_true',
+                       help='If no transformations are made, copy input bytes to output to preserve exact byte identity')
+    parser.add_argument('--semantic-check', action='store_true',
+                       help='After writing output, check semantic graph isomorphism (rdflib) and report ISOMORPHIC/DIFFERENT')
     
     args = parser.parse_args()
     
@@ -2016,7 +2119,9 @@ Default Output:
         memory_efficient=args.memory_efficient,
         enable_skos_xl=args.enable_skos_xl,
         autofix_broader=args.autofix_broader,
-        warn_missing_narrower=args.warn_missing_narrower
+        warn_missing_narrower=args.warn_missing_narrower,
+        preserve_byte_identity=args.preserve_byte_identity,
+        semantic_check=args.semantic_check
     )
     
     # Print configuration if verbose
@@ -2028,6 +2133,8 @@ Default Output:
         print(f"[CONFIG] Autofix broader: {args.autofix_broader}")
         print(f"[CONFIG] Warn missing narrower (info): {args.warn_missing_narrower}")
         print(f"[CONFIG] Reports enabled: {not args.no_reports}")
+        print(f"[CONFIG] Preserve byte identity: {args.preserve_byte_identity}")
+        print(f"[CONFIG] Semantic check: {args.semantic_check}")
         print()
     
     # Process file
